@@ -1,0 +1,1875 @@
+1. Project Folder Structure
+===========================
+ADOA/
+|
+├── main.py
+├── reader.py
+├── standardizer.py
+├── comparator.py
+├── ai_engine.py
+├── config.py
+└── output/ (Generated Reports & Emails)
+
+
+2. Installed Libraries / Requirements
+=====================================
+- pandas (Data manipulation)
+- numpy (Numerical operations)
+- google-genai / google.generativeai (Gemini API for AI Analysis)
+
+
+3. Main Entry File (main.py)
+============================
+"""
+main.py -- ADOA: Asset Data & Outage Analysis Tool
+
+Entry point that orchestrates the full pipeline.
+Supports two modes:
+  --auto   : Process the single Excel file in the project root
+  --batch  : Process ALL Excel files in the Excels/ folder
+
+Pipeline steps (per file):
+  1. Read Excel data
+  2. Standardize data + auto-detect date columns
+  3. AI Column Analysis (suggest comparison rules)
+  4. Detect mismatches & compute KPIs
+  5. Generate CSV report
+  6. AI Analysis (generate prose for report + email)
+  7. Generate Final Report (report_final.txt)
+  8. Generate Final Email (email_final.txt)
+  9. Generate Pipeline Summary
+"""
+
+import sys
+import os
+
+# Ensure project directory is on path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from reader import read_excel, print_data_preview, print_column, print_row, find_excel_file, find_all_excel_files
+from standardizer import standardize
+from comparator import MismatchDetector, export_csv_report
+from ai_engine import generate_ai_outputs, suggest_comparison_rules
+from config import OUTPUT_DIR, EXCELS_DIR, REPORT_FILENAME, EMAIL_FILENAME, SUMMARY_FILENAME
+
+
+# --- Global State (for interactive mode) -----------------------------------------
+_df = None
+_date_cols = None
+_parse_errors = None
+_errors = None
+_kpis = None
+_report_text = None
+_email_draft = None
+_comparison_rules = None
+
+
+def process_single_file(file_path, output_dir=None):
+    """
+    Process a single Excel file through the full pipeline.
+    Returns (success, result_dict) or (False, None) on failure.
+    """
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
+
+    filename = os.path.basename(file_path)
+    file_label = os.path.splitext(filename)[0]
+
+    print("\n" + "+" + "=" * 78 + "+")
+    print("|" + f" Processing: {filename} ".center(78) + "|")
+    print("+" + "=" * 78 + "+")
+
+    # Step 1: Read Excel
+    print(f"\n>> STEP 1/9: Reading '{filename}'...")
+    try:
+        df = read_excel(file_path)
+    except Exception as e:
+        print(f"\n[ERROR] Failed to read '{filename}': {e}")
+        return False, None
+
+    # Step 2: Standardize + auto-detect date columns
+    print("\n>> STEP 2/9: Standardizing Data & Detecting Date Columns...")
+    df, date_cols, parse_errors = standardize(df)
+
+    # Step 3: AI Column Analysis (suggest comparison rules)
+    print("\n>> STEP 3/9: AI Column Analysis (Suggesting Comparison Rules)...")
+    comparison_rules = suggest_comparison_rules(df, date_cols)
+
+    # Step 4: Detect Mismatches & Compute KPIs
+    print("\n>> STEP 4/9: Detecting Mismatches & Computing KPIs...")
+    detector = MismatchDetector(df, date_cols, parse_errors, comparison_rules=comparison_rules)
+    errors, kpis = detector.run_all_checks()
+
+    # Step 5: CSV Report
+    print("\n>> STEP 5/9: Generating CSV Report...")
+    csv_path = export_csv_report(errors, output_dir=output_dir)
+
+    # Step 6-8: AI Analysis + Final Report + Final Email
+    print("\n>> STEP 6-8/9: Generating AI Analysis, Final Report & Email...")
+    ai_results = generate_ai_outputs(
+        df, errors, kpis, date_cols,
+        comparison_rules=comparison_rules,
+        output_dir=output_dir,
+    )
+
+    # Step 9: Pipeline Summary
+    print("\n>> STEP 9/9: Generating Pipeline Summary...")
+    _save_pipeline_summary(df, date_cols, comparison_rules, errors, kpis, output_dir)
+
+    # --- Final Summary ---
+    print("\n" + "-" * 60)
+    print(f"  [{file_label}] COMPLETE")
+    print(f"  [DATA]  {df.shape[0]} rows x {df.shape[1]} columns")
+    print(f"  [DATE]  {len(date_cols)} date columns detected")
+    print(f"  [RULE]  {len(comparison_rules)} AI-suggested rules applied")
+    print(f"  [WARN]  Errors detected: {len(errors)}")
+    print(f"  [KPI]   Data fill rate: {kpis['data_quality']['fill_rate_pct']}%")
+    if kpis.get("availability"):
+        print(f"  [OK]    Availability date match: {kpis['availability']['match_pct']}%")
+    print(f"  [OUT]   Output dir: {output_dir}")
+    print("-" * 60)
+
+    return True, {
+        "file": filename,
+        "df": df,
+        "date_cols": date_cols,
+        "errors": errors,
+        "kpis": kpis,
+        "comparison_rules": comparison_rules,
+        "report_text": ai_results.get("report_full", ""),
+        "email_draft": ai_results.get("email_full", ""),
+    }
+
+
+def run_full_pipeline():
+    """Execute the pipeline on the single Excel file in the project root."""
+    global _df, _date_cols, _parse_errors, _errors, _kpis
+    global _report_text, _email_draft, _comparison_rules
+
+    print("\n" + "+" + "=" * 78 + "+")
+    print("|" + " ADOA -- Asset Data & Outage Analysis Tool ".center(78) + "|")
+    print("+" + "=" * 78 + "+")
+
+    try:
+        file_path = find_excel_file()
+    except FileNotFoundError as e:
+        print(f"\n[FATAL] {e}")
+        print("Please place your Excel file (.xlsx or .xls) in the project directory.")
+        return False
+
+    success, result = process_single_file(file_path, output_dir=OUTPUT_DIR)
+    if success and result:
+        _df = result["df"]
+        _date_cols = result["date_cols"]
+        _errors = result["errors"]
+        _kpis = result["kpis"]
+        _comparison_rules = result["comparison_rules"]
+        _report_text = result["report_text"]
+        _email_draft = result["email_draft"]
+
+    return success
+
+
+def run_batch_pipeline():
+    """Process ALL Excel files in the Excels/ folder."""
+
+    print("\n" + "+" + "=" * 78 + "+")
+    print("|" + " ADOA -- BATCH MODE ".center(78) + "|")
+    print("|" + f" Scanning: {EXCELS_DIR} ".center(78) + "|")
+    print("+" + "=" * 78 + "+")
+
+    if not os.path.isdir(EXCELS_DIR):
+        print(f"\n[FATAL] Excels directory not found: {EXCELS_DIR}")
+        print("Please create an 'Excels' folder in the project directory and add Excel files.")
+        return False
+
+    excel_files = find_all_excel_files(EXCELS_DIR)
+    if not excel_files:
+        print("\n[FATAL] No Excel files found in the Excels/ folder.")
+        return False
+
+    print(f"\n{'=' * 60}")
+    print(f"  BATCH: {len(excel_files)} file(s) to process")
+    print(f"{'=' * 60}")
+
+    results = []
+    for i, file_path in enumerate(excel_files, 1):
+        filename = os.path.basename(file_path)
+        file_label = os.path.splitext(filename)[0]
+
+        # Each file gets its own output subdirectory
+        file_output_dir = os.path.join(OUTPUT_DIR, file_label)
+
+        print(f"\n\n{'#' * 78}")
+        print(f"  FILE {i}/{len(excel_files)}: {filename}")
+        print(f"  Output: output/{file_label}/")
+        print(f"{'#' * 78}")
+
+        success, result = process_single_file(file_path, output_dir=file_output_dir)
+        results.append({
+            "file": filename,
+            "success": success,
+            "result": result,
+        })
+
+    # --- Batch Summary ---
+    print("\n\n" + "+" + "=" * 78 + "+")
+    print("|" + " BATCH PROCESSING COMPLETE ".center(78) + "|")
+    print("+" + "=" * 78 + "+")
+
+    for r in results:
+        status = "OK" if r["success"] else "FAILED"
+        if r["success"] and r["result"]:
+            kpis = r["result"]["kpis"]
+            errs = len(r["result"]["errors"])
+            fill = kpis["data_quality"]["fill_rate_pct"]
+            rules = len(r["result"]["comparison_rules"])
+            print(f"  [{status}] {r['file']:<35s}  {errs:>3d} errors  |  {fill}% fill  |  {rules} rules")
+        else:
+            print(f"  [{status}] {r['file']}")
+
+    succeeded = sum(1 for r in results if r["success"])
+    print(f"\n  {succeeded}/{len(results)} files processed successfully")
+    print(f"  Output folders in: {OUTPUT_DIR}")
+
+    return succeeded == len(results)
+
+
+def _save_pipeline_summary(df, date_cols, comparison_rules, errors, kpis, output_dir):
+    """Save a pipeline summary to the output directory."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    summary_lines = [
+        "=" * 70,
+        "  ADOA PIPELINE SUMMARY",
+        "=" * 70,
+        "",
+        f"  Dataset:           {df.shape[0]} rows x {df.shape[1]} columns",
+        f"  Date Columns:      {len(date_cols)} detected: {', '.join(date_cols)}",
+        f"  Comparison Rules:  {len(comparison_rules)} AI-suggested",
+        f"  Total Errors:      {len(errors)}",
+        f"  Data Fill Rate:    {kpis['data_quality']['fill_rate_pct']}%",
+    ]
+
+    if kpis.get("availability"):
+        avail = kpis["availability"]
+        summary_lines.append(f"  Date Match Rate:   {avail['match_pct']}%")
+        summary_lines.append(f"  Dates Matching:    {avail['dates_matching']}")
+        summary_lines.append(f"  Dates Mismatched:  {avail['dates_not_matching']}")
+
+    if kpis.get("error_breakdown"):
+        summary_lines.append("")
+        summary_lines.append("  Error Breakdown:")
+        for etype, count in sorted(kpis["error_breakdown"].items(), key=lambda x: -x[1]):
+            summary_lines.append(f"    {etype:<35s}: {count}")
+
+    summary_lines.append("")
+    summary_lines.append("  AI-Suggested Comparison Rules:")
+    for i, rule in enumerate(comparison_rules, 1):
+        summary_lines.append(
+            f"    {i}. [{rule.get('check_type', 'N/A')}] "
+            f"{rule.get('col_a', '')} vs {rule.get('col_b', '')}"
+        )
+        summary_lines.append(f"       {rule.get('description', '')}")
+
+    summary_lines.append("")
+    summary_lines.append("=" * 70)
+
+    filepath = os.path.join(output_dir, SUMMARY_FILENAME)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines))
+    print(f"[SUMMARY] Pipeline summary saved to: {filepath}")
+
+
+def show_menu():
+    """Show interactive menu."""
+    print("\n" + "-" * 50)
+    print("  ADOA -- Interactive Menu")
+    print("-" * 50)
+    print("  1. Run Full Pipeline (single file)")
+    print("  2. Run Batch Pipeline (Excels/ folder)")
+    print("  3. Preview Raw Data")
+    print("  4. Print Specific Column")
+    print("  5. Print Specific Row")
+    print("  6. Print Report")
+    print("  7. Print Email Draft")
+    print("  8. Print Error Summary")
+    print("  0. Exit")
+    print("-" * 50)
+
+
+def interactive_mode():
+    """Run the interactive menu loop."""
+    global _df, _date_cols, _parse_errors, _errors, _kpis, _report_text, _email_draft
+
+    while True:
+        show_menu()
+        choice = input("\n  Enter choice (0-8): ").strip()
+
+        if choice == "1":
+            run_full_pipeline()
+
+        elif choice == "2":
+            run_batch_pipeline()
+
+        elif choice == "3":
+            if _df is None:
+                print("\n[INFO] No data loaded. Running reader first...")
+                _df = read_excel()
+                _df, _date_cols, _parse_errors = standardize(_df)
+            print_data_preview(_df)
+
+        elif choice == "4":
+            if _df is None:
+                print("\n[INFO] No data loaded. Running reader first...")
+                _df = read_excel()
+                _df, _date_cols, _parse_errors = standardize(_df)
+            print(f"\n  Available columns: {list(_df.columns)}")
+            col = input("  Enter column name: ").strip().upper()
+            print_column(_df, col)
+
+        elif choice == "5":
+            if _df is None:
+                print("\n[INFO] No data loaded. Running reader first...")
+                _df = read_excel()
+                _df, _date_cols, _parse_errors = standardize(_df)
+            try:
+                idx = int(input("  Enter row index (0-based): ").strip())
+                print_row(_df, idx)
+            except ValueError:
+                print("[ERROR] Please enter a valid integer.")
+
+        elif choice == "6":
+            if _report_text:
+                print("\n" + "=" * 80)
+                print("FINAL REPORT")
+                print("=" * 80)
+                print(_report_text)
+            else:
+                print("\n[INFO] No report generated yet. Run the pipeline first (option 1 or 2).")
+
+        elif choice == "7":
+            if _email_draft:
+                print("\n" + "=" * 80)
+                print("FINAL EMAIL")
+                print("=" * 80)
+                print(_email_draft)
+            else:
+                print("\n[INFO] No email draft generated yet. Run the pipeline first (option 1 or 2).")
+
+        elif choice == "8":
+            if _errors is not None:
+                print("\n" + "=" * 80)
+                print(f"ERROR SUMMARY -- {len(_errors)} errors")
+                print("=" * 80)
+                if _kpis and "error_breakdown" in _kpis:
+                    from config import ERROR_TYPES
+                    for etype, count in _kpis["error_breakdown"].items():
+                        desc = ERROR_TYPES.get(etype, "")
+                        print(f"  {etype:<30s}: {count:4d}  -- {desc}")
+                print(f"\n  First 20 errors:")
+                for err in _errors[:20]:
+                    print(f"    Row {err['row']:3d} | {err['error_type']:<25s} | {err['column']}")
+                    print(f"           Expected: {str(err['expected'])[:60]}")
+                    print(f"           Actual:   {str(err['actual'])[:60]}")
+                    print()
+            else:
+                print("\n[INFO] No errors detected yet. Run the pipeline first (option 1 or 2).")
+
+        elif choice == "0":
+            print("\nGoodbye!")
+            break
+
+        else:
+            print("\n[ERROR] Invalid choice. Please enter 0-8.")
+
+
+def main():
+    """Entry point."""
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+
+        if mode == "--auto":
+            # Single file mode
+            run_full_pipeline()
+
+        elif mode == "--batch":
+            # Batch mode: all files in Excels/
+            run_batch_pipeline()
+
+        else:
+            print(f"Unknown flag: {sys.argv[1]}")
+            print("Usage: python main.py [--auto | --batch]")
+            print("  --auto   Process the single Excel file in the project root")
+            print("  --batch  Process ALL Excel files in the Excels/ folder")
+
+    else:
+        # Interactive mode
+        interactive_mode()
+
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------------------------------------
+
+4. AI Module & 5. Report Generator (ai_engine.py)
+=================================================
+"""
+ai_engine.py -- Gemini AI integration for ADOA.
+
+Builds structured prompts from error data and KPIs,
+calls the Gemini API with retry logic, and generates:
+  - Executive summary and anomaly analysis
+  - Root cause hypotheses
+  - Investigation steps
+  - Recommendations
+  - Management email body
+
+Also handles:
+  - Dynamic column comparison rule suggestion via AI
+  - Full report and email assembly with data tables
+  - Fallback to defaults when API is unavailable
+
+Falls back to plain-text defaults if the API is unavailable.
+"""
+
+import os
+import json
+import time
+from collections import OrderedDict
+from config import (
+    GEMINI_API_KEYS, GEMINI_MODEL, OUTPUT_DIR,
+    REPORT_FILENAME, EMAIL_FILENAME,
+    DEFAULT_COMPARISON_RULES, ERROR_TYPES,
+)
+
+# Per-key retries before moving to next key
+RETRIES_PER_KEY = 2
+RETRY_WAIT_SECONDS = 5
+
+# Table formatting
+COL_W = 58
+LINE = "=" * 90
+THIN = "_" * 90
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _call_gemini(prompt, label=""):
+    """
+    Call Gemini API with multi-key fallback.
+    Tries each API key in GEMINI_API_KEYS with retries before moving to the next.
+    Flow: Key1 (2 tries) -> Key2 (2 tries) -> Key3 (2 tries) -> Key4 (2 tries) -> fail
+    Returns (text, success_bool).
+    """
+    if not GEMINI_API_KEYS:
+        print(f"[AI] No API keys configured.")
+        return None, False
+
+    try:
+        from google import genai
+    except ImportError:
+        print("[AI] google-genai not installed. Run: pip install google-genai")
+        return None, False
+
+    total_keys = len(GEMINI_API_KEYS)
+
+    for key_idx, api_key in enumerate(GEMINI_API_KEYS, 1):
+        key_label = f"Key {key_idx}/{total_keys}"
+        client = genai.Client(api_key=api_key)
+
+        for attempt in range(RETRIES_PER_KEY):
+            try:
+                print(f"[AI] {label} | {key_label}, attempt {attempt + 1}/{RETRIES_PER_KEY}...")
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                )
+                text = response.text.strip()
+                print(f"[AI] {label} generated successfully using {key_label}.")
+                return text, True
+
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    if attempt < RETRIES_PER_KEY - 1:
+                        print(f"[AI] {key_label} rate limited. Waiting {RETRY_WAIT_SECONDS}s before retry...")
+                        time.sleep(RETRY_WAIT_SECONDS)
+                    else:
+                        print(f"[AI] {key_label} quota exhausted. Moving to next key...")
+                        break
+                elif "401" in err or "403" in err or "INVALID" in err or "PERMISSION" in err:
+                    print(f"[AI] {key_label} is invalid or unauthorized. Moving to next key...")
+                    break
+                else:
+                    print(f"[AI] {key_label} error: {e}")
+                    if attempt < RETRIES_PER_KEY - 1:
+                        print(f"[AI] Retrying in {RETRY_WAIT_SECONDS}s...")
+                        time.sleep(RETRY_WAIT_SECONDS)
+                    else:
+                        print(f"[AI] {key_label} failed. Moving to next key...")
+                        break
+
+    print(f"[AI] All {total_keys} API keys exhausted. Using fallback.")
+    return None, False
+
+
+# ---------------------------------------------------------------------------
+# Dynamic rule suggestion
+# ---------------------------------------------------------------------------
+
+def suggest_comparison_rules(df, date_columns):
+    """
+    Ask Gemini to suggest date comparison rules based on column names.
+    Falls back to DEFAULT_COMPARISON_RULES (filtered to existing columns) if AI fails.
+
+    Returns: list of rule dicts with keys: col_a, col_b, rule, check_type, description
+    """
+    print("\n" + "-" * 60)
+    print("AI COLUMN ANALYSIS -- Suggesting comparison rules")
+    print("-" * 60)
+
+    if not date_columns or len(date_columns) < 2:
+        print("[AI] Not enough date columns for comparison rules. Using defaults.")
+        return _filter_default_rules(df)
+
+    # Build a small prompt with just column names
+    all_cols = list(df.columns)
+    # Include first 2 sample rows for context
+    sample_data = ""
+    try:
+        sample = df[date_columns].head(2).to_string()
+        sample_data = f"\nSample data (first 2 rows):\n{sample}\n"
+    except Exception:
+        pass
+
+    prompt = f"""Given these columns from a dataset, suggest date comparison rules.
+
+Date columns detected: {date_columns}
+All columns: {all_cols}
+{sample_data}
+Suggest 3-10 comparison rules as a JSON array. Each rule must have:
+- "col_a": first date column name (must be from the date columns list)
+- "col_b": second date column name (must be from the date columns list)
+- "check_type": one of "A_BEFORE_B", "A_AFTER_B", "A_EQUALS_B_DATE", "A_WITHIN_DAYS_B", "A_BEFORE_OR_EQUAL_B", "A_AFTER_OR_EQUAL_B"
+- "rule": a short UPPER_SNAKE_CASE name for the rule
+- "description": one sentence explaining what the rule checks
+
+Only use columns that exist in the date columns list. Focus on logical business relationships.
+Return ONLY the JSON array, no other text."""
+
+    response_text, success = _call_gemini(prompt, label="Column Analysis")
+
+    if success and response_text:
+        try:
+            # Parse JSON from response (handle markdown code blocks)
+            json_text = response_text.strip()
+            if json_text.startswith("```"):
+                json_text = json_text.split("\n", 1)[1]
+                json_text = json_text.rsplit("```", 1)[0]
+            rules = json.loads(json_text)
+
+            # Validate rules
+            valid_check_types = (
+                "A_BEFORE_B", "A_AFTER_B", "A_EQUALS_B_DATE",
+                "A_WITHIN_DAYS_B", "A_BEFORE_OR_EQUAL_B", "A_AFTER_OR_EQUAL_B",
+            )
+            valid_rules = []
+            for r in rules:
+                if (r.get("col_a") in date_columns and
+                    r.get("col_b") in date_columns and
+                    r.get("check_type") in valid_check_types and
+                    r.get("rule") and r.get("description")):
+                    valid_rules.append(r)
+
+            if valid_rules:
+                print(f"[AI] Suggested {len(valid_rules)} comparison rules:")
+                for r in valid_rules:
+                    print(f"  {r['rule']}: {r['col_a']} vs {r['col_b']} ({r['check_type']})")
+                return valid_rules
+            else:
+                print("[AI] No valid rules parsed from AI response. Using defaults.")
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            print(f"[AI] Could not parse rule suggestions: {e}. Using defaults.")
+
+    return _filter_default_rules(df)
+
+
+def _filter_default_rules(df):
+    """Return DEFAULT_COMPARISON_RULES filtered to columns that exist in the DataFrame."""
+    filtered = [
+        r for r in DEFAULT_COMPARISON_RULES
+        if r["col_a"] in df.columns and r["col_b"] in df.columns
+    ]
+    if filtered:
+        print(f"[AI] Using {len(filtered)} default rules (filtered to existing columns).")
+    else:
+        print("[AI] No default rules match the columns in this file.")
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# Year distribution builder (for trend analysis)
+# ---------------------------------------------------------------------------
+
+def _build_year_distribution(df, errors, date_columns):
+    """
+    Build year-wise distribution of records and errors.
+    Uses the first viable date column to determine the year of each row.
+    Returns a list of formatted lines, or empty list if no date data.
+    """
+    import pandas as pd
+
+    # Find the best date column (one with most non-null values)
+    best_col = None
+    best_count = 0
+    for col in date_columns:
+        if col in df.columns and pd.api.types.is_datetime64_any_dtype(df[col]):
+            valid = df[col].notna().sum()
+            if valid > best_count:
+                best_count = valid
+                best_col = col
+
+    if not best_col or best_count == 0:
+        return []
+
+    # Count records per year
+    years = df[best_col].dropna().dt.year
+    year_record_counts = years.value_counts().sort_index().to_dict()
+
+    if len(year_record_counts) < 1:
+        return []
+
+    # Count errors per year (map row number -> year)
+    row_to_year = {}
+    for idx in range(len(df)):
+        val = df[best_col].iloc[idx]
+        if pd.notna(val):
+            row_to_year[idx + 2] = val.year  # row numbers are 1-indexed + header
+
+    year_error_counts = {}
+    for err in errors:
+        row = err.get("row", 0)
+        year = row_to_year.get(row)
+        if year:
+            year_error_counts[year] = year_error_counts.get(year, 0) + 1
+
+    # Format
+    lines = [f"(Based on: {best_col})"]
+    lines.append(f"  {'Year':<8} {'Records':<10} {'Errors':<10} {'Errors/Record':<15}")
+    lines.append(f"  {'----':<8} {'-------':<10} {'------':<10} {'-------------':<15}")
+    for year in sorted(year_record_counts.keys()):
+        recs = year_record_counts[year]
+        errs = year_error_counts.get(year, 0)
+        rate = round(errs / recs, 1) if recs > 0 else 0
+        lines.append(f"  {year:<8} {recs:<10} {errs:<10} {rate:<15}")
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Data summary builder (for AI prompts)
+# ---------------------------------------------------------------------------
+
+def _build_data_summary(df, errors, kpis, date_columns):
+    """
+    Build a lean, structured data summary for the AI prompt.
+    Deliberately minimal to stay within free-tier token limits.
+    """
+    dq = kpis.get("data_quality", {})
+    avail = kpis.get("availability", {})
+    breakdown = kpis.get("error_breakdown", {})
+    missing_summary = kpis.get("missing_data_summary", {})
+    date_completeness = kpis.get("date_completeness", {})
+    total_rows = df.shape[0]
+    total_errors = sum(breakdown.values())
+
+    lines = []
+
+    # --- Dataset KPIs ---
+    lines.append("DATASET OVERVIEW:")
+    lines.append(f"  Rows={total_rows} | Columns={df.shape[1]} | Fill Rate={dq.get('fill_rate_pct','N/A')}% | Null Cells={dq.get('null_cells','N/A')}")
+    if avail:
+        lines.append(
+            f"  Availability Date Match={avail.get('match_pct','N/A')}% "
+            f"({avail.get('dates_matching',0)} match / {avail.get('dates_not_matching',0)} mismatch "
+            f"of {avail.get('total_records_with_both_dates',0)} comparable records)"
+        )
+    lines.append("")
+
+    # --- Error counts ---
+    lines.append(f"ERROR COUNTS ({total_errors} total):")
+    for etype, count in sorted(breakdown.items(), key=lambda x: -x[1]):
+        pct = round((count / total_errors) * 100, 1) if total_errors else 0
+        lines.append(f"  {etype}: {count} ({pct}%)")
+    lines.append("")
+
+    # --- Missing data ---
+    lines.append("MISSING DATA (column: missing/total %):")
+    for col in date_columns:
+        dc = date_completeness.get(col, {})
+        miss = dc.get("missing", 0)
+        if miss > 0:
+            pct = round((miss / total_rows) * 100, 1)
+            lines.append(f"  {col}: {miss}/{total_rows} ({pct}%) [date]")
+    for col, cnt in sorted(missing_summary.items(), key=lambda x: -x[1]):
+        pct = round((cnt / total_rows) * 100, 1)
+        lines.append(f"  {col}: {cnt}/{total_rows} ({pct}%)")
+    lines.append("")
+
+    # --- Per-row summary: top 15 worst rows ---
+    grouped = OrderedDict()
+    for err in sorted(errors, key=lambda e: e.get("row", 0)):
+        row = err.get("row", 0)
+        if row not in grouped:
+            grouped[row] = {
+                "id": err.get("id", "N/A"),
+                "ticket": err.get("ticket", "N/A"),
+                "etypes": [],
+                "missing_cols": [],
+            }
+        if err["error_type"] == "MISSING_DATA":
+            grouped[row]["missing_cols"].append(err.get("column", ""))
+        else:
+            grouped[row]["etypes"].append(err["error_type"])
+
+    sorted_rows = sorted(
+        grouped.items(),
+        key=lambda x: len(x[1]["etypes"]) + len(x[1]["missing_cols"]),
+        reverse=True,
+    )
+    top_rows = sorted_rows[:15]
+    remaining = sorted_rows[15:]
+
+    lines.append(f"TOP 15 WORST ROWS (of {len(grouped)} total affected rows):")
+    for row_num, data in top_rows:
+        total_row_errs = len(data["etypes"]) + len(data["missing_cols"])
+        parts = []
+        if data["etypes"]:
+            unique_etypes = list(dict.fromkeys(data["etypes"]))
+            parts.append("Errors:[" + ",".join(unique_etypes) + "]")
+        if data["missing_cols"]:
+            parts.append("Missing:[" + ",".join(data["missing_cols"]) + "]")
+        lines.append(
+            f"  Row {row_num} | ID:{data['id']} | Ticket:{data['ticket']} "
+            f"| TotalErrors:{total_row_errs} | {' | '.join(parts)}"
+        )
+
+    if remaining:
+        lines.append(
+            f"  ...plus {len(remaining)} more rows with smaller error counts "
+            f"(1-3 errors each, mostly MISSING_DATA)."
+        )
+
+    # --- Year-wise distribution ---
+    year_dist = _build_year_distribution(df, errors, date_columns)
+    if year_dist:
+        lines.append("")
+        lines.append("YEAR-WISE DISTRIBUTION:")
+        for year_line in year_dist:
+            lines.append(f"  {year_line}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Prompt builders
+# ---------------------------------------------------------------------------
+
+def _build_report_prompt(data_summary, kpis):
+    """Build a richer report prompt with 5 analysis sections."""
+    dq = kpis.get("data_quality", {})
+    avail = kpis.get("availability", {})
+    breakdown = kpis.get("error_breakdown", {})
+    total_errors = sum(breakdown.values())
+    top_errors = sorted(breakdown.items(), key=lambda x: -x[1])[:3]
+    top_str = ", ".join([f"{e[0].replace('_', ' ').title()} ({e[1]})" for e in top_errors])
+
+    return f"""Analyze this data quality report for business managers.
+Write plain text only, no markdown/asterisks/bullet symbols. Use numbered lists where needed.
+
+Dataset: {dq.get('total_rows',48)} records, {dq.get('fill_rate_pct','N/A')}% fill rate, {total_errors} errors, {avail.get('match_pct','N/A')}% date match. Top issues: {top_str}.
+
+Provide EXACTLY these 5 sections with these headers:
+
+EXECUTIVE SUMMARY:
+3-4 sentences covering: what was analyzed, overall data quality score, total errors found, and the single most critical finding that needs immediate attention.
+
+ANOMALY ANALYSIS:
+For each of the top 4-5 error types, write 2-3 sentences in plain English explaining: what the error means in business terms, how many records are affected, and what operational impact it has. Do not use bullet points.
+
+ROOT CAUSE ANALYSIS:
+3-5 numbered root causes. Reference specific column names and error patterns. Explain WHY these errors are occurring (process gaps, system issues, training gaps).
+
+INVESTIGATION STEPS:
+3-4 numbered specific actions the team should take to verify and investigate the flagged records. Include what to check, who should do it, and expected timeline.
+
+RECOMMENDATIONS:
+4-6 numbered process improvements to prevent these errors in future. Be specific to this dataset and include both quick fixes and long-term solutions.
+
+YEAR-WISE TRENDS:
+Look at the YEAR-WISE DISTRIBUTION data provided. Identify any year-over-year patterns:
+- Are errors increasing or decreasing over the years?
+- Are certain years significantly worse than others?
+- Are there seasonal or temporal patterns in the data quality issues?
+If the data spans only one year or has no date variation, note that and skip.
+
+Keep the total response under 700 words.
+
+DATA:
+{data_summary}
+"""
+
+
+def _build_email_prompt(data_summary, kpis):
+    """Build a richer email prompt with 5 paragraphs."""
+    dq = kpis.get("data_quality", {})
+    avail = kpis.get("availability", {})
+    breakdown = kpis.get("error_breakdown", {})
+    total_errors = sum(breakdown.values())
+    top_errors = sorted(breakdown.items(), key=lambda x: -x[1])[:3]
+    top_error_str = ", ".join([f"{e[0].replace('_', ' ').title()} ({e[1]})" for e in top_errors])
+
+    return f"""Write 5 paragraphs for a management email about data quality issues.
+Plain text only, no markdown. Under 300 words total. Professional, factual tone.
+
+Key facts: {dq.get('total_rows',48)} records, {dq.get('total_columns',22)} columns, {dq.get('fill_rate_pct','N/A')}% fill rate, {total_errors} errors, {avail.get('match_pct','N/A')}% date match, top issues: {top_error_str}.
+
+Para 1: What was analyzed and the methodology used (automated data quality check on equipment availability dataset).
+Para 2: Key findings with specific numbers (error count, fill rate, match rate).
+Para 3: Most critical concerns and their business impact.
+Para 4: Specific columns and records that need immediate attention.
+Para 5: Next steps -- reports are attached, request the team review and correct flagged records, suggest a follow-up review.
+
+Do NOT include "Dear sir/ma'am" or "Regards" -- those are added separately.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Fallback generators
+# ---------------------------------------------------------------------------
+
+def _fallback_report_text(kpis, errors):
+    """Return a plain-text fallback matching the same 5-section structure the AI would produce."""
+    breakdown = kpis.get("error_breakdown", {})
+    total_errors = sum(breakdown.values())
+    dq = kpis.get("data_quality", {})
+    avail = kpis.get("availability", {})
+
+    top_errors = sorted(breakdown.items(), key=lambda x: -x[1])[:3]
+    top_str = ", ".join([f"{e[0].replace('_',' ').title()} ({e[1]})" for e in top_errors])
+
+    # Build error type descriptions for anomaly section
+    anomaly_lines = []
+    for etype, count in sorted(breakdown.items(), key=lambda x: -x[1])[:5]:
+        desc = ERROR_TYPES.get(etype, "Unknown error type")
+        pct = round((count / total_errors) * 100, 1) if total_errors else 0
+        anomaly_lines.append(
+            f"{etype.replace('_', ' ').title()} ({count} occurrences, {pct}% of all errors): "
+            f"{desc}. This affects data reliability and may impact operational reporting accuracy."
+        )
+
+    lines = [
+        "EXECUTIVE SUMMARY:",
+        f"The dataset ({dq.get('total_rows','N/A')} records, "
+        f"{dq.get('total_columns','N/A')} columns) was analyzed for data quality issues. "
+        f"The overall data fill rate is {dq.get('fill_rate_pct','N/A')}% with "
+        f"{total_errors} errors detected across all records. "
+        f"The availability date match rate is {avail.get('match_pct','N/A')}%. "
+        f"The most significant issues are: {top_str}.",
+        "",
+        "ANOMALY ANALYSIS:",
+    ]
+    for al in anomaly_lines:
+        lines.append(al)
+        lines.append("")
+
+    lines += [
+        "ROOT CAUSE ANALYSIS:",
+        "1. Incomplete data entry procedures -- several fields have high missing rates,",
+        "   suggesting they are not enforced as mandatory in the data entry process.",
+        "2. Timing discrepancies in record creation -- created dates often precede",
+        "   actual availability dates, indicating records are filled before work completes.",
+        "3. Delayed record modifications -- modified dates frequently exceed acceptable",
+        "   thresholds after creation, suggesting updates are not made promptly.",
+        "4. Data entry sequencing issues -- maintenance start times appear before entry",
+        "   timestamps in many records, pointing to incorrect timestamp recording.",
+        "",
+        "INVESTIGATION STEPS:",
+        "1. Pull all records with missing data in high-impact columns and verify whether",
+        "   the data can be recovered from maintenance logs or operator records.",
+        "2. Review the flagged date mismatch records with site supervisors to determine",
+        "   if the discrepancies reflect actual operational issues or data entry errors.",
+        "3. Check whether the delayed modification pattern correlates with specific",
+        "   operators, shifts, or sites to identify targeted training needs.",
+        "",
+        "RECOMMENDATIONS:",
+        "1. Make high-missing-rate columns mandatory fields in the data entry form.",
+        "2. Add validation rules to prevent illogical date sequences at the point of entry.",
+        "3. Implement a review process requiring records to be completed and modified",
+        "   within 24 hours of the actual availability date.",
+        "4. Conduct targeted training for data entry staff on correct timestamp sequencing.",
+        "5. Review the detailed error table below and correct all flagged records,",
+        "   prioritizing rows with the highest error counts.",
+        "",
+        "(Note: Gemini API was unavailable. This is an automated fallback analysis.)",
+    ]
+    return "\n".join(lines)
+
+
+def _fallback_email_body(kpis):
+    """Return a plain-text fallback email body matching the 5-paragraph structure."""
+    breakdown = kpis.get("error_breakdown", {})
+    total_errors = sum(breakdown.values())
+    dq = kpis.get("data_quality", {})
+    avail = kpis.get("availability", {})
+    top_errors = sorted(breakdown.items(), key=lambda x: -x[1])[:3]
+    top_str = ", ".join([f"{e[0].replace('_',' ').title()} ({e[1]})" for e in top_errors])
+
+    return (
+        f"This email is regarding the automated data quality analysis conducted on "
+        f"the equipment availability dataset. The dataset contains "
+        f"{dq.get('total_rows', 'N/A')} records across {dq.get('total_columns', 'N/A')} "
+        f"columns. An automated quality check was performed covering missing data detection, "
+        f"date comparison validation, and full file scan for completeness.\n"
+        f"\n"
+        f"The analysis identified a total of {total_errors} errors and mismatches, with an "
+        f"overall data fill rate of {dq.get('fill_rate_pct', 'N/A')}%. "
+        f"The availability date match rate stands at {avail.get('match_pct', 'N/A')}%, "
+        f"with {avail.get('dates_not_matching', 0)} records showing a date discrepancy.\n"
+        f"\n"
+        f"The most critical concerns are: {top_str}. "
+        f"These issues indicate significant gaps in data entry completeness and consistency "
+        f"that may affect operational reporting and decision-making.\n"
+        f"\n"
+        f"Immediate attention is recommended for columns with the highest missing data rates "
+        f"and records flagged with date comparison errors. The summary tables below provide "
+        f"a breakdown of all issues by category and affected columns.\n"
+        f"\n"
+        f"Detailed reports have been generated and are available in the output folder. "
+        f"Please review the flagged records and take corrective action at the earliest "
+        f"opportunity. A follow-up review is recommended within one week to track progress."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section builder helper
+# ---------------------------------------------------------------------------
+
+def _section(title):
+    """Return a formatted section header."""
+    return f"\n{THIN}\n\n  {title}\n{THIN}\n"
+
+
+# Known AI subsection headers (matched case-insensitively with trailing colon)
+_AI_SUBSECTION_HEADERS = [
+    "EXECUTIVE SUMMARY",
+    "ANOMALY ANALYSIS",
+    "ROOT CAUSE ANALYSIS",
+    "INVESTIGATION STEPS",
+    "RECOMMENDATIONS",
+    "YEAR-WISE TRENDS",
+]
+
+
+def _format_ai_analysis(ai_text):
+    """
+    Format AI-generated analysis text with visual sub-section headers.
+    Detects known section titles and wraps them in boxed headers.
+    Regular text gets indented. Blank lines are preserved for spacing.
+    """
+    lines = ai_text.split("\n")
+    formatted = []
+    sub_w = 70  # width for sub-section box
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Check if this line is a known sub-section header
+        is_header = False
+        for header in _AI_SUBSECTION_HEADERS:
+            if stripped.upper().startswith(header):
+                is_header = True
+                formatted.append("")
+                formatted.append(f"    +{'-' * sub_w}+")
+                formatted.append(f"    |  {header:<{sub_w - 3}}|")
+                formatted.append(f"    +{'-' * sub_w}+")
+                formatted.append("")
+                break
+
+        if not is_header:
+            if stripped == "":
+                formatted.append("")
+            else:
+                # Wrap long lines at ~85 chars for readability
+                _wrap_and_indent(stripped, formatted, indent=6, width=82)
+
+    return formatted
+
+
+def _wrap_and_indent(text, output_list, indent=6, width=82):
+    """Word-wrap text to width and add to output_list with indentation."""
+    prefix = " " * indent
+    if len(text) <= width:
+        output_list.append(f"{prefix}{text}")
+        return
+
+    words = text.split()
+    current_line = ""
+    for word in words:
+        if current_line and len(current_line) + 1 + len(word) > width:
+            output_list.append(f"{prefix}{current_line}")
+            current_line = word
+        else:
+            current_line = f"{current_line} {word}" if current_line else word
+
+    if current_line:
+        output_list.append(f"{prefix}{current_line}")
+
+
+
+# ---------------------------------------------------------------------------
+# Row detail builder (matches report_generator.py format)
+# ---------------------------------------------------------------------------
+
+def _build_row_details(errors):
+    """Build detailed error breakdown by row, matching the original report format."""
+    grouped = OrderedDict()
+    for err in sorted(errors, key=lambda e: (e.get("row", 0), e.get("column", ""))):
+        row = err.get("row", 0)
+        if row not in grouped:
+            grouped[row] = {
+                "ticket": err.get("ticket", "N/A"),
+                "id": err.get("id", "N/A"),
+                "errors": [],
+            }
+        grouped[row]["errors"].append(err)
+
+    total_errors = sum(len(d["errors"]) for d in grouped.values())
+    lines = []
+
+    for row_num, data in grouped.items():
+        ticket = data["ticket"]
+        record_id = data["id"]
+        err_list = data["errors"]
+
+        # Separate errors by category
+        date_error_types = {
+            "MISSING_DATE", "START_BEFORE_ENTRY", "DATE_MISMATCH",
+            "CREATED_BEFORE_ACTUAL", "CREATED_AFTER_ACTUAL",
+            "MODIFIED_BEFORE_CREATED", "MODIFIED_TOO_LATE",
+            "MODIFIED_BEFORE_ACTUAL", "DATE_ORDER_ERROR",
+            "DATE_MATCH_ERROR", "DATE_PROXIMITY_ERROR",
+        }
+        date_errors = [e for e in err_list if e["error_type"] in date_error_types]
+        data_errors = [e for e in err_list if e["error_type"] == "MISSING_DATA"]
+        other_errors = [e for e in err_list if e not in date_errors and e not in data_errors]
+
+        lines.append("")
+        lines.append(f"    +{'-'*84}+")
+        lines.append(f"    |  Row {row_num:<4}   ID: {record_id:<10}   Ticket: {ticket:<25}  Errors: {len(err_list):<4} |")
+        lines.append(f"    +{'-'*84}+")
+
+        if date_errors:
+            lines.append(f"      Date/Comparison Issues ({len(date_errors)}):")
+            for e in date_errors:
+                col = e.get("column", "")
+                etype = e.get("error_type", "")
+                expected = str(e.get("expected", ""))
+                actual = str(e.get("actual", ""))
+                lines.append(f"        * [{etype}]  {col}")
+                lines.append(f"          Expected : {expected}")
+                lines.append(f"          Actual   : {actual}")
+
+        if data_errors:
+            missing_cols = [e.get("column", "") for e in data_errors]
+            lines.append(f"      Missing Data ({len(data_errors)}):")
+            lines.append(f"        Columns: {', '.join(missing_cols)}")
+
+        if other_errors:
+            lines.append(f"      Other Issues ({len(other_errors)}):")
+            for e in other_errors:
+                col = e.get("column", "")
+                etype = e.get("error_type", "")
+                lines.append(f"        * [{etype}]  {col}")
+                lines.append(f"          {e.get('expected', '')} vs {e.get('actual', '')}")
+
+    return lines, len(grouped), total_errors
+
+
+# ---------------------------------------------------------------------------
+# Public interface -- generates final report + email
+# ---------------------------------------------------------------------------
+
+def generate_ai_outputs(df, errors, kpis, date_columns, comparison_rules=None, output_dir=None):
+    """
+    Main entry point. Generates the FINAL report and email.
+
+    Builds the full document structure in code (all tables, all row details)
+    and inserts AI-generated insights into Section 2 (above tables).
+
+    Saves:
+      - <output_dir>/report_final.txt  (complete report with everything)
+      - <output_dir>/email_final.txt   (complete email with tables)
+
+    Returns:
+        dict with keys: 'report_analysis', 'email_body', 'report_success', 'email_success'
+    """
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
+
+    print("\n" + "=" * 80)
+    print("GENERATING AI ANALYSIS (Gemini)")
+    print("=" * 80)
+
+
+    data_summary = _build_data_summary(df, errors, kpis, date_columns)
+
+    # --- Generate AI prose ---
+    report_prompt = _build_report_prompt(data_summary, kpis)
+    report_ai_text, report_success = _call_gemini(report_prompt, label="Report Analysis")
+
+    if not report_success or not report_ai_text:
+        print("[AI] Using fallback for report analysis.")
+        report_ai_text = _fallback_report_text(kpis, errors)
+
+    email_prompt = _build_email_prompt(data_summary, kpis)
+    email_ai_text, email_success = _call_gemini(email_prompt, label="Email Body")
+
+    if not email_success or not email_ai_text:
+        print("[AI] Using fallback for email body.")
+        email_ai_text = _fallback_email_body(kpis)
+
+    # --- Extract shared data for tables ---
+    dq = kpis.get("data_quality", {})
+    avail = kpis.get("availability", {})
+    breakdown = kpis.get("error_breakdown", {})
+    total_errors = sum(breakdown.values())
+    missing_summary = kpis.get("missing_data_summary", {})
+    date_completeness = kpis.get("date_completeness", {})
+    total_rows = dq.get("total_rows", df.shape[0])
+
+    # Column error counts
+    column_counts = {}
+    for err in errors:
+        col = err.get("column", "Unknown")
+        column_counts[col] = column_counts.get(col, 0) + 1
+    top_columns = sorted(column_counts.items(), key=lambda x: -x[1])[:5]
+
+    # Use provided rules or defaults
+    rules_used = comparison_rules or _filter_default_rules(df)
+
+    # ===================================================================
+    # BUILD FINAL REPORT (complete, with all sections + row details)
+    # ===================================================================
+    rpt = []
+    rpt.append(LINE)
+    rpt.append("")
+    rpt.append("    ADOA  --  FINAL ANALYSIS REPORT")
+    rpt.append("    Data Quality & Error Analysis")
+    rpt.append("")
+    rpt.append(LINE)
+
+    # --- Section 1: Data Overview ---
+    rpt.append(_section("1.  DATA OVERVIEW"))
+    rpt.append(f"    Total Rows           :  {total_rows}")
+    rpt.append(f"    Total Columns        :  {dq.get('total_columns', df.shape[1])}")
+    rpt.append(f"    Total Cells          :  {dq.get('total_cells', 'N/A')}")
+    rpt.append(f"    Null Cells           :  {dq.get('null_cells', 'N/A')}")
+    rpt.append(f"    Data Fill Rate       :  {dq.get('fill_rate_pct', 'N/A')}%")
+    rpt.append(f"    Date Columns Found   :  {len(date_columns)}")
+    if avail:
+        rpt.append("")
+        rpt.append("    --- Availability (date only, time ignored) ---")
+        rpt.append(f"    Records compared     :  {avail.get('total_records_with_both_dates', 'N/A')}")
+        rpt.append(f"    Dates matching       :  {avail.get('dates_matching', 'N/A')}")
+        rpt.append(f"    Dates not matching   :  {avail.get('dates_not_matching', 'N/A')}")
+        rpt.append(f"    Match percentage     :  {avail.get('match_pct', 'N/A')}%")
+
+    # --- Section 2: AI ANALYSIS (ABOVE tables) ---
+    rpt.append(_section("2.  AI ANALYSIS"))
+    rpt.extend(_format_ai_analysis(report_ai_text))
+
+
+    # --- Section 3: Comparison Rules Used ---
+    rpt.append(_section("3.  COMPARISON RULES APPLIED"))
+    if rules_used:
+        for i, rule in enumerate(rules_used, 1):
+            rpt.append(f"    Rule {i}:  {rule.get('rule', 'N/A')}")
+            rpt.append(f"            {rule.get('col_a', '')}  vs  {rule.get('col_b', '')}")
+            rpt.append(f"            {rule.get('description', '')}")
+            rpt.append("")
+    else:
+        rpt.append("    No comparison rules were applicable for this dataset.")
+
+    # --- Section 4: Missing Data Summary ---
+    rpt.append(_section("4.  MISSING DATA SUMMARY  (Full File Scan)"))
+    rpt.append(f"    {'Column':<{COL_W}s}  {'Missing / Total':<15s}  {'%':<8s}  What is it?")
+    rpt.append(f"    {'-'*COL_W}  {'-'*15}  {'-'*8}  {'-'*30}")
+
+    for col in date_columns:
+        dc = date_completeness.get(col, {})
+        miss = dc.get("missing", 0)
+        if miss > 0:
+            pct = round((miss / total_rows) * 100, 1)
+            rpt.append(f"    {col:<{COL_W}s}  {miss:>5d} / {total_rows:<5d}   {pct:>6.1f}%  Date column")
+
+    for col, cnt in sorted(missing_summary.items(), key=lambda x: -x[1]):
+        pct = round((cnt / total_rows) * 100, 1)
+        rpt.append(f"    {col:<{COL_W}s}  {cnt:>5d} / {total_rows:<5d}   {pct:>6.1f}%")
+
+    # --- Section 5: Error/Mismatch Summary ---
+    rpt.append(_section("5.  ERROR / MISMATCH SUMMARY"))
+    rpt.append(f"    {'Error Type':<{COL_W}s}  {'Count':>6s}  Description")
+    rpt.append(f"    {'-'*COL_W}  {'-'*6}  {'-'*40}")
+    for etype, count in sorted(breakdown.items(), key=lambda x: -x[1]):
+        desc = ERROR_TYPES.get(etype, "")
+        rpt.append(f"    {etype:<{COL_W}s}  {count:>6d}  {desc}")
+    rpt.append(f"    {'-'*COL_W}  {'-'*6}")
+    rpt.append(f"    {'TOTAL':<{COL_W}s}  {total_errors:>6d}")
+
+    # --- Section 6: Top Affected Columns ---
+    rpt.append(_section("6.  TOP AFFECTED COLUMNS"))
+    rpt.append(f"    {'Column':<{COL_W}s}  {'Errors':>6s}")
+    rpt.append(f"    {'-'*COL_W}  {'-'*6}")
+    for col, cnt in top_columns:
+        rpt.append(f"    {col:<{COL_W}s}  {cnt:>6d}")
+
+    # --- Section 7: Detailed Errors by Row ---
+    row_detail_lines, row_count, row_total_errors = _build_row_details(errors)
+    rpt.append(_section(f"7.  DETAILED ERRORS BY ROW  ({row_count} rows, {row_total_errors} errors)"))
+    rpt.extend(row_detail_lines)
+
+    # --- Footer ---
+    rpt.append("")
+    rpt.append(LINE)
+    rpt.append(f"  END OF REPORT  --  {row_count} rows  |  {row_total_errors} total errors")
+    rpt.append(LINE)
+
+    report_full = "\n".join(rpt)
+
+    # ===================================================================
+    # BUILD FINAL EMAIL (AI prose + all tables)
+    # ===================================================================
+    email_lines = []
+
+    # AI-generated body paragraphs
+    email_lines.append(email_ai_text)
+
+    # Missing data table
+    has_missing = any(
+        date_completeness.get(c, {}).get("missing", 0) > 0 for c in date_columns
+    ) or bool(missing_summary)
+
+    if has_missing:
+        email_lines.append("")
+        email_lines.append("Missing Data Summary (Full File Scan):")
+        email_lines.append("")
+        email_lines.append(f"  {'Column':<{COL_W}s}  {'Missing':>7s}  {'Total':>5s}  {'% Missing':>9s}")
+        email_lines.append(f"  {'-'*COL_W}  {'-'*7}  {'-'*5}  {'-'*9}")
+
+        for col in date_columns:
+            dc = date_completeness.get(col, {})
+            miss = dc.get("missing", 0)
+            if miss > 0:
+                pct = round((miss / total_rows) * 100, 1)
+                email_lines.append(f"  {col:<{COL_W}s}  {miss:>7d}  {total_rows:>5d}  {pct:>8.1f}%")
+
+        for col, cnt in sorted(missing_summary.items(), key=lambda x: -x[1]):
+            pct = round((cnt / total_rows) * 100, 1)
+            email_lines.append(f"  {col:<{COL_W}s}  {cnt:>7d}  {total_rows:>5d}  {pct:>8.1f}%")
+
+    # Error summary table
+    email_lines.append("")
+    email_lines.append("Error/Mismatch Summary:")
+    email_lines.append("")
+    email_lines.append(f"  {'Error Type':<{COL_W}s}  {'Count':>6s}  Description")
+    email_lines.append(f"  {'-'*COL_W}  {'-'*6}  {'-'*40}")
+    for etype, count in sorted(breakdown.items(), key=lambda x: -x[1]):
+        desc = ERROR_TYPES.get(etype, "")
+        email_lines.append(f"  {etype:<{COL_W}s}  {count:>6d}  {desc}")
+    email_lines.append(f"  {'-'*COL_W}  {'-'*6}")
+    email_lines.append(f"  {'TOTAL':<{COL_W}s}  {total_errors:>6d}")
+
+    # Top affected columns
+    email_lines.append("")
+    email_lines.append("Top Affected Columns:")
+    email_lines.append("")
+    email_lines.append(f"  {'Column':<{COL_W}s}  {'Errors':>6s}")
+    email_lines.append(f"  {'-'*COL_W}  {'-'*6}")
+    for col, cnt in top_columns:
+        email_lines.append(f"  {col:<{COL_W}s}  {cnt:>6d}")
+    email_lines.append("")
+
+    email_body_full = "\n".join(email_lines)
+
+    # Wrap with Dear/Regards template
+    from config import EMAIL_TEMPLATE
+    email_draft_full = EMAIL_TEMPLATE.format(body=email_body_full)
+
+    # --- Save files ---
+    os.makedirs(output_dir, exist_ok=True)
+
+    report_path = os.path.join(output_dir, REPORT_FILENAME)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_full)
+    print(f"[AI] Final report saved to: {report_path}")
+
+    email_path = os.path.join(output_dir, EMAIL_FILENAME)
+    with open(email_path, "w", encoding="utf-8") as f:
+        f.write(email_draft_full)
+    print(f"[AI] Final email saved to: {email_path}")
+
+    return {
+        "report_analysis": report_ai_text,
+        "email_body": email_ai_text,
+        "report_full": report_full,
+        "email_full": email_draft_full,
+        "report_success": report_success,
+        "email_success": email_success,
+    }
+
+
+if __name__ == "__main__":
+    from reader import read_excel
+    from standardizer import standardize
+    from comparator import MismatchDetector
+
+    df = read_excel()
+    df, date_cols, parse_errors = standardize(df)
+    rules = suggest_comparison_rules(df, date_cols)
+    detector = MismatchDetector(df, date_cols, parse_errors, comparison_rules=rules)
+    errors, kpis = detector.run_all_checks()
+    result = generate_ai_outputs(df, errors, kpis, date_cols, comparison_rules=rules)
+    print("\n--- REPORT SAVED ---")
+    print(f"Report: output/{REPORT_FILENAME}")
+    print(f"Email: output/{EMAIL_FILENAME}")
+
+--------------------------------------------------------------------------------
+
+6. Validation Module (comparator.py)
+====================================
+"""
+comparator.py -- KPI comparison and mismatch detection module.
+
+Compares date columns using 5 specific rules, detects missing data,
+finds similar columns, and exports a consolidated CSV report.
+"""
+
+import os
+import pandas as pd
+import numpy as np
+from collections import OrderedDict
+from config import (
+    DEFAULT_COMPARISON_RULES,
+    CRITICAL_COLUMNS,
+    ERROR_TYPES,
+    SIMILARITY_THRESHOLD,
+    OUTPUT_DIR,
+    CSV_REPORT_FILENAME,
+)
+
+
+class MismatchDetector:
+    """Detects mismatches, missing data, and anomalies in the DataFrame."""
+
+    def __init__(self, df, date_columns, parse_errors=None, comparison_rules=None):
+        self.df = df
+        self.date_columns = date_columns
+        self.parse_errors = parse_errors or []
+        # Use provided rules, or filter defaults to columns that exist
+        if comparison_rules:
+            self.comparison_rules = comparison_rules
+        else:
+            self.comparison_rules = [
+                r for r in DEFAULT_COMPARISON_RULES
+                if r["col_a"] in df.columns and r["col_b"] in df.columns
+            ]
+        self.errors = []
+        self.kpis = {}
+
+    def run_all_checks(self):
+        """Run all detection checks and return results."""
+        print("\n" + "=" * 80)
+        print("RUNNING MISMATCH DETECTION & KPI ANALYSIS")
+        print("=" * 80)
+
+        self._check_missing_dates()
+        self._check_date_comparisons()
+        self._check_all_missing_data()
+        self._check_similar_columns()
+        self._compute_kpis()
+
+        print(f"\n[COMPARATOR] Total errors/mismatches detected: {len(self.errors)}")
+        return self.errors, self.kpis
+
+    # -----------------------------------------------------------------
+    # Rule: Missing dates in the 6 required date columns
+    # -----------------------------------------------------------------
+    def _check_missing_dates(self):
+        """Check for missing/null values in the 6 required date columns only."""
+        print("\n-- Checking Missing Dates (6 required columns) --")
+        count = 0
+        for col in self.date_columns:
+            if col not in self.df.columns:
+                continue
+            null_mask = self.df[col].isnull()
+            null_rows = self.df.index[null_mask].tolist()
+            for row_idx in null_rows:
+                self.errors.append({
+                    "row": row_idx + 2,
+                    "column": col,
+                    "error_type": "MISSING_DATE",
+                    "expected": "A valid date",
+                    "actual": "NULL / Empty",
+                    "description": f"Missing date in '{col}' at row {row_idx + 2}",
+                    "ticket": self._get_ticket(row_idx),
+                    "id": self._get_id(row_idx),
+                })
+                count += 1
+        print(f"  Found {count} missing date values across {len(self.date_columns)} columns.")
+
+    # -----------------------------------------------------------------
+    # 5 Date Comparison Rules
+    # -----------------------------------------------------------------
+    def _check_date_comparisons(self):
+        """Run all 5 date comparison rules."""
+        print("\n-- Running Date Comparison Rules --")
+
+        for rule_def in self.comparison_rules:
+            col_a = rule_def["col_a"]
+            col_b = rule_def["col_b"]
+            rule = rule_def["rule"]
+            desc = rule_def["description"]
+
+            if col_a not in self.df.columns or col_b not in self.df.columns:
+                print(f"  [!] Skipping rule '{rule}': column(s) not found.")
+                continue
+
+            print(f"  Rule: {rule}")
+            print(f"    {col_a} vs {col_b}")
+            mismatch_count = 0
+
+            for idx in range(len(self.df)):
+                val_a = self.df[col_a].iloc[idx]
+                val_b = self.df[col_b].iloc[idx]
+
+                # Skip if either is null
+                if pd.isna(val_a) or pd.isna(val_b):
+                    continue
+
+                error = self._apply_rule(rule, col_a, col_b, val_a, val_b, idx)
+                if error:
+                    self.errors.append(error)
+                    mismatch_count += 1
+
+            print(f"    -> {mismatch_count} issues found.")
+
+    def _apply_rule(self, rule, col_a, col_b, val_a, val_b, idx):
+        """
+        Apply a comparison rule using generic check_type dispatch.
+        All rules are AI-driven — no hardcoded column-specific logic.
+        Returns an error dict or None.
+        """
+        row_num = idx + 2
+        ticket = self._get_ticket(idx)
+        record_id = self._get_id(idx)
+
+        # Look up the check_type from the rule definition
+        check_type = None
+        description = ""
+        for rule_def in self.comparison_rules:
+            if rule_def["rule"] == rule:
+                check_type = rule_def.get("check_type")
+                description = rule_def.get("description", "")
+                break
+
+        if not check_type:
+            return None
+
+        # --- A_BEFORE_B: col_a should be chronologically before col_b ---
+        if check_type == "A_BEFORE_B":
+            if val_a > val_b:
+                return {
+                    "row": row_num,
+                    "column": f"{col_a} vs {col_b}",
+                    "error_type": "DATE_ORDER_ERROR",
+                    "expected": f"{col_a} should be before {col_b}",
+                    "actual": f"{col_a}={val_a}, {col_b}={val_b}",
+                    "description": description or f"{col_a} is after {col_b}",
+                    "ticket": ticket,
+                    "id": record_id,
+                }
+
+        # --- A_AFTER_B: col_a should be chronologically after col_b ---
+        elif check_type == "A_AFTER_B":
+            if val_a < val_b:
+                return {
+                    "row": row_num,
+                    "column": f"{col_a} vs {col_b}",
+                    "error_type": "DATE_ORDER_ERROR",
+                    "expected": f"{col_a} should be after {col_b}",
+                    "actual": f"{col_a}={val_a}, {col_b}={val_b}",
+                    "description": description or f"{col_a} is before {col_b}",
+                    "ticket": ticket,
+                    "id": record_id,
+                }
+
+        # --- A_EQUALS_B_DATE: dates should match (time ignored) ---
+        elif check_type == "A_EQUALS_B_DATE":
+            date_a = val_a.date() if hasattr(val_a, 'date') else val_a
+            date_b = val_b.date() if hasattr(val_b, 'date') else val_b
+            if date_a != date_b:
+                return {
+                    "row": row_num,
+                    "column": f"{col_a} vs {col_b}",
+                    "error_type": "DATE_MATCH_ERROR",
+                    "expected": f"{col_a} date should equal {col_b} date",
+                    "actual": f"{col_a}={date_a}, {col_b}={date_b}",
+                    "description": description or "Dates do not match (time ignored)",
+                    "ticket": ticket,
+                    "id": record_id,
+                }
+
+        # --- A_WITHIN_DAYS_B: dates should be within N days of each other ---
+        elif check_type == "A_WITHIN_DAYS_B":
+            diff_days = abs((val_a - val_b).total_seconds()) / 86400
+            if diff_days > 1.0:
+                return {
+                    "row": row_num,
+                    "column": f"{col_a} vs {col_b}",
+                    "error_type": "DATE_PROXIMITY_ERROR",
+                    "expected": f"{col_a} within 1 day of {col_b}",
+                    "actual": f"{col_a}={val_a}, {col_b}={val_b} ({diff_days:.1f} days apart)",
+                    "description": description or f"Dates are {diff_days:.1f} days apart",
+                    "ticket": ticket,
+                    "id": record_id,
+                }
+
+        # --- A_BEFORE_OR_EQUAL_B: col_a <= col_b ---
+        elif check_type == "A_BEFORE_OR_EQUAL_B":
+            if val_a > val_b:
+                return {
+                    "row": row_num,
+                    "column": f"{col_a} vs {col_b}",
+                    "error_type": "DATE_ORDER_ERROR",
+                    "expected": f"{col_a} should be before or equal to {col_b}",
+                    "actual": f"{col_a}={val_a}, {col_b}={val_b}",
+                    "description": description or f"{col_a} is after {col_b}",
+                    "ticket": ticket,
+                    "id": record_id,
+                }
+
+        # --- A_AFTER_OR_EQUAL_B: col_a >= col_b ---
+        elif check_type == "A_AFTER_OR_EQUAL_B":
+            if val_a < val_b:
+                return {
+                    "row": row_num,
+                    "column": f"{col_a} vs {col_b}",
+                    "error_type": "DATE_ORDER_ERROR",
+                    "expected": f"{col_a} should be after or equal to {col_b}",
+                    "actual": f"{col_a}={val_a}, {col_b}={val_b}",
+                    "description": description or f"{col_a} is before {col_b}",
+                    "ticket": ticket,
+                    "id": record_id,
+                }
+
+        return None
+
+
+    # -----------------------------------------------------------------
+    # Full file scan -- check ALL columns for missing data
+    # -----------------------------------------------------------------
+    def _check_all_missing_data(self):
+        """Scan every column in the file for missing/null values."""
+        print("\n-- Full File Scan: Checking ALL Columns for Missing Data --")
+
+        # Columns already checked by _check_missing_dates (skip duplicates)
+        skip_cols = set(self.date_columns)
+
+        # Explanation for why each column matters
+        COLUMN_EXPLANATIONS = {
+            "SPMSTATUS": "SPM status indicates current state of the ticket",
+            "TICKETNO": "Ticket number is the primary identifier for tracking",
+            "ACTION": "Action describes what maintenance was performed",
+            "STATION": "Station identifies the location of the equipment",
+            "SPMNO": "SPM number uniquely identifies the equipment",
+            "REASONIFBREAKDOWN": "Reason for breakdown explains the root cause",
+            "TYPEOFMAINTENANCE": "Type of maintenance categorizes the work done",
+            "DETAILSOFMAINTENANCE": "Details provide specifics of maintenance performed",
+            "ACTIONTAKEN": "Action taken describes the corrective measures applied",
+            "CONTROLROOM": "Control room identifies the monitoring station",
+            "EQUIPMENT": "Equipment identifies the specific asset maintained",
+            "NULLVOID": "Null/void flag indicates cancelled or invalid tickets",
+            "MODIFIEDBY": "Modified by tracks who last updated the record",
+            "HOSTADDRESS": "Host address identifies the system origin",
+            "STATUS": "Status indicates current record state",
+            "ID": "Record ID is the unique database identifier",
+        }
+
+        total_missing = 0
+        col_summary = {}
+
+        for col in self.df.columns:
+            if col in skip_cols:
+                continue
+
+            null_mask = self.df[col].isnull()
+            null_count = null_mask.sum()
+
+            if null_count == 0:
+                continue
+
+            col_summary[col] = null_count
+            explanation = COLUMN_EXPLANATIONS.get(col, f"Data field '{col}'")
+
+            null_rows = self.df.index[null_mask].tolist()
+            for row_idx in null_rows:
+                self.errors.append({
+                    "row": row_idx + 2,
+                    "column": col,
+                    "error_type": "MISSING_DATA",
+                    "expected": "A value",
+                    "actual": "NULL / Empty",
+                    "description": f"{explanation} -- missing at row {row_idx + 2}",
+                    "ticket": self._get_ticket(row_idx),
+                    "id": self._get_id(row_idx),
+                })
+                total_missing += 1
+
+        print(f"  Found {total_missing} missing values across {len(col_summary)} columns:")
+        for col, cnt in sorted(col_summary.items(), key=lambda x: -x[1]):
+            pct = round((cnt / len(self.df)) * 100, 1)
+            print(f"    {col:<40s}: {cnt:>3d} / {len(self.df)}  ({pct}% missing)")
+
+        # Store for report/email use
+        self.missing_data_summary = col_summary
+
+    # -----------------------------------------------------------------
+    # Similar column detection
+    # -----------------------------------------------------------------
+    def _check_similar_columns(self):
+        """Find pairs of columns with similar data and flag mismatches."""
+        print("\n-- Checking Similar Columns --")
+        cols = [c for c in self.df.columns if c not in ("EDIT", "NULLANDVOIDTICKETS")]
+        checked = set()
+        similar_pairs = []
+
+        # Build set of columns already in comparison rules
+        rule_cols = set()
+        for r in self.comparison_rules:
+            rule_cols.add((r["col_a"], r["col_b"]))
+            rule_cols.add((r["col_b"], r["col_a"]))
+
+        for i, col_a in enumerate(cols):
+            for j, col_b in enumerate(cols):
+                if i >= j:
+                    continue
+                pair_key = (col_a, col_b)
+                if pair_key in checked:
+                    continue
+                checked.add(pair_key)
+
+                if self.df[col_a].dtype != self.df[col_b].dtype:
+                    continue
+
+                if pair_key in rule_cols or (col_b, col_a) in rule_cols:
+                    continue
+
+                both_valid = self.df[col_a].notna() & self.df[col_b].notna()
+                if both_valid.sum() == 0:
+                    continue
+
+                matching = (self.df.loc[both_valid, col_a] == self.df.loc[both_valid, col_b]).sum()
+                similarity = matching / both_valid.sum()
+
+                if similarity >= SIMILARITY_THRESHOLD and similarity < 1.0:
+                    similar_pairs.append((col_a, col_b, similarity))
+                    mismatch_mask = both_valid & (self.df[col_a] != self.df[col_b])
+                    mismatch_rows = self.df.index[mismatch_mask].tolist()
+                    for row_idx in mismatch_rows:
+                        self.errors.append({
+                            "row": row_idx + 2,
+                            "column": f"{col_a} vs {col_b}",
+                            "error_type": "SIMILAR_COLUMN_MISMATCH",
+                            "expected": str(self.df[col_a].iloc[row_idx]),
+                            "actual": str(self.df[col_b].iloc[row_idx]),
+                            "description": f"Similar columns ({similarity:.0%} match) have different values",
+                            "ticket": self._get_ticket(row_idx),
+                            "id": self._get_id(row_idx),
+                        })
+
+        if similar_pairs:
+            print(f"  Found {len(similar_pairs)} similar column pairs:")
+            for a, b, sim in similar_pairs:
+                print(f"    {a} <-> {b} ({sim:.0%} similar)")
+        else:
+            print("  No similar column pairs detected.")
+
+    # -----------------------------------------------------------------
+    # KPI computation
+    # -----------------------------------------------------------------
+    def _compute_kpis(self):
+        """Compute KPIs from the data."""
+        print("\n-- Computing KPIs --")
+
+        # 1. Date completeness per date column
+        date_completeness = {}
+        for col in self.date_columns:
+            if col not in self.df.columns:
+                continue
+            total = len(self.df)
+            valid = self.df[col].notna().sum()
+            date_completeness[col] = {
+                "total": total,
+                "valid": int(valid),
+                "missing": int(total - valid),
+                "completeness_pct": round((valid / total) * 100, 1),
+            }
+
+        # 2. Availability KPI (expected vs actual — date only)
+        exp_col = "EXPECTEDDATEOFAVAILABILITY"
+        act_col = "ACTUALDATEOFAVAILABILITY"
+        availability_kpi = {}
+        if exp_col in self.df.columns and act_col in self.df.columns:
+            both_valid = self.df[exp_col].notna() & self.df[act_col].notna()
+            if both_valid.sum() > 0:
+                exp_dates = self.df.loc[both_valid, exp_col].dt.date
+                act_dates = self.df.loc[both_valid, act_col].dt.date
+                matching = (exp_dates == act_dates).sum()
+                not_matching = (exp_dates != act_dates).sum()
+
+                availability_kpi = {
+                    "total_records_with_both_dates": int(both_valid.sum()),
+                    "dates_matching": int(matching),
+                    "dates_not_matching": int(not_matching),
+                    "match_pct": round((matching / both_valid.sum()) * 100, 1),
+                }
+
+        # 3. Overall data quality
+        total_cells = self.df.shape[0] * self.df.shape[1]
+        null_cells = int(self.df.isnull().sum().sum())
+        data_quality = {
+            "total_rows": self.df.shape[0],
+            "total_columns": self.df.shape[1],
+            "total_cells": total_cells,
+            "null_cells": null_cells,
+            "fill_rate_pct": round(((total_cells - null_cells) / total_cells) * 100, 1),
+        }
+
+        # 4. Error breakdown by type
+        error_breakdown = {}
+        for err in self.errors:
+            etype = err["error_type"]
+            error_breakdown[etype] = error_breakdown.get(etype, 0) + 1
+
+        # 5. Status distribution
+        status_dist = {}
+        if "SPMSTATUS" in self.df.columns:
+            status_dist = self.df["SPMSTATUS"].value_counts().to_dict()
+
+        self.kpis = {
+            "date_completeness": date_completeness,
+            "availability": availability_kpi,
+            "data_quality": data_quality,
+            "error_breakdown": error_breakdown,
+            "status_distribution": status_dist,
+            "missing_data_summary": getattr(self, "missing_data_summary", {}),
+        }
+
+        # Print summary
+        print(f"  Data Quality: {data_quality['fill_rate_pct']}% fill rate")
+        print(f"  Total errors: {len(self.errors)}")
+        for etype, cnt in error_breakdown.items():
+            print(f"    {etype}: {cnt}")
+        if availability_kpi:
+            print(f"  Availability date match: {availability_kpi['match_pct']}%")
+
+    # -----------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------
+    def _get_ticket(self, row_idx):
+        if "TICKETNO" in self.df.columns and row_idx < len(self.df):
+            return str(self.df["TICKETNO"].iloc[row_idx])
+        return "N/A"
+
+    def _get_id(self, row_idx):
+        if "ID" in self.df.columns and row_idx < len(self.df):
+            return str(self.df["ID"].iloc[row_idx])
+        return "N/A"
+
+
+# =====================================================================
+# CSV Export (grouped by row)
+# =====================================================================
+def export_csv_report(errors, output_dir=None):
+    """
+    Export all errors to a CSV file, grouped by row number.
+    Each row appears once with all its errors consolidated.
+    """
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
+
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, CSV_REPORT_FILENAME)
+
+    if not errors:
+        print("[COMPARATOR] No errors to export.")
+        df = pd.DataFrame(columns=[
+            "row", "id", "ticket", "error_count", "columns_affected", "error_types", "details"
+        ])
+    else:
+        grouped = OrderedDict()
+        for err in sorted(errors, key=lambda e: e.get("row", 0)):
+            row = err.get("row", 0)
+            if row not in grouped:
+                grouped[row] = {
+                    "row": row,
+                    "id": err.get("id", "N/A"),
+                    "ticket": err.get("ticket", "N/A"),
+                    "columns": [],
+                    "error_types": [],
+                    "details": [],
+                }
+            grouped[row]["columns"].append(str(err.get("column", "")))
+            grouped[row]["error_types"].append(str(err.get("error_type", "")))
+            detail = f"{err.get('column','')}: {err.get('error_type','')} (expected={err.get('expected','')}, actual={err.get('actual','')})"
+            grouped[row]["details"].append(detail)
+
+        rows = []
+        for row_num, data in grouped.items():
+            rows.append({
+                "row": data["row"],
+                "id": data["id"],
+                "ticket": data["ticket"],
+                "error_count": len(data["columns"]),
+                "columns_affected": " | ".join(data["columns"]),
+                "error_types": " | ".join(data["error_types"]),
+                "details": " | ".join(data["details"]),
+            })
+        df = pd.DataFrame(rows)
+
+    df.to_csv(filepath, index=False)
+    print(f"\n[COMPARATOR] CSV report saved to: {filepath}")
+    print(f"  Total rows: {len(df)} (consolidated from {len(errors)} errors)")
+    return filepath
+
+
+if __name__ == "__main__":
+    from reader import read_excel
+    from standardizer import standardize
+
+    df = read_excel()
+    df, date_cols, parse_errors = standardize(df)
+
+    detector = MismatchDetector(df, date_cols, parse_errors)
+    errors, kpis = detector.run_all_checks()
+    csv_path = export_csv_report(errors)
+
+    print(f"\nKPIs: {kpis}")
+
+--------------------------------------------------------------------------------
+
